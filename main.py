@@ -1,233 +1,216 @@
 #!/usr/bin/env python3
-"""Entry for make.fun's polymarket-nvidia-ceo-forecast-01.
+"""Forecast Polymarket's "Next CEO of NVIDIA?" Yes prices, 240 minutes ahead.
 
-Forecasts, minute by minute and 4 hours ahead, the Yes price of every trading
-market of Polymarket's "Next CEO of NVIDIA?" event, as five quantiles
-[0.05, 0.25, 0.5, 0.75, 0.95] per minute, minimising the mean pinball loss.
+Method (per market, from that market's own price history only):
 
-Design (all three parts were found in the practice history, then verified by
-backtesting on all six practice cases against answers reconstructed from the
-cases themselves and from Polymarket's public price history):
+  * Median: asymmetric mean reversion. The median drifts from the last price
+    back toward the recent level (the mean of the last LEVEL_WINDOW minutes).
+    Up-spikes revert hard; down-moves mostly stick. Reversion strength grows
+    with horizon and the adjustment is shrunk by SHRINK.
+  * Bands: empirical quantiles of the market's own past h-step price changes,
+    recency-weighted (decay RECENCY_TAU minutes), computed on a coarse
+    horizon grid and interpolated in log-horizon, then centred on the
+    reversion median. No Gaussian assumption: the tails are whatever the
+    market actually did.
+  * Floor: the 90% band half-width never falls below a floor that grows
+    slowly with horizon, so quiet markets still carry honest uncertainty.
+  * Fallbacks: pooled cross-market bands (scaled by the market's own
+    1-minute volatility) when a market has too little history; the house
+    persistence baseline if anything at all fails for a market.
 
-1. Median: persistence + ASYMMETRIC mean reversion. A positive 60-minute trend
-   reverts hard (regression beta 0.21 at h=5 growing to 0.79 at h=240); a
-   negative trend sticks (beta ~ 0). Up-spikes in these thin markets are
-   mostly quote noise that fades; down-moves are real repricing. The fitted
-   beta is shrunk to 85% for robustness.
-2. Spread: EMPIRICAL quantiles of h-minute price changes, per market, computed
-   at a grid of horizons and interpolated in log-h, recentered on the modeled
-   median. The change distribution has a big atom at zero (71-97% of minutes
-   are flat) and fat, asymmetric tails, so normal bands are far too wide in
-   the middle and mis-shaped in the tails. Changes are recency-weighted
-   (exponential decay, tau = 150 min) so the bands track the current regime.
-3. Floor: a minimum half-width growing like h^0.37, so a market flat for a day
-   does not get zero-width bands the minute it wakes up.
-
-Backtest on the six practice cases (answers reconstructed exactly: the
-baseline starter reproduces its published 0.363589 on the same scorer):
-  this entry  loss 0.270340, median error 0.729894, 90% coverage 0.8855
-  house baseline loss 0.363589, median error 0.767503, 90% coverage 0.9496
-It beats the baseline on every practice case (p00 0.456, p01 0.305, p02 0.350,
-p03 0.291, p04 0.170, p05 0.114) and stays ahead of it under synthetic jump
-stress tests (sustained +0.15 / -0.10 moves injected into the answers).
-
-Standard library only, no network, deterministic (no randomness, no clocks).
-Runs a 24-market case in ~1 second (cap: 8 s).
+Stdlib only. Deterministic: no randomness, fixed iteration order, so two
+runs write the same bytes.
 """
-import json, math, os
 
-TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
-H_GRID = [1, 2, 3, 5, 8, 12, 20, 30, 45, 60, 90, 120, 180, 240]
+import bisect
+import json
+import math
+import os
 
-DEFAULTS = dict(
-    window=4320,        # minutes of history used for empirical spreads (72 h)
-    trend_look=60,      # minutes for the reversion trend
-    beta_up_a=-0.027,   # beta_up(h) = clip(a + b*ln(h)) * shrink
-    beta_up_b=0.149,
-    beta_up_shrink=0.85,
-    beta_up_max=0.80,
-    beta_dn=0.0,        # down-trend coefficient (0 = persistence; down-moves stick)
-    floor_hw240=0.004,  # minimum half-width (q95-q50) at h=240
-    floor_exp=0.37,     # horizon exponent of the floor
-    pool_blend=0.0,     # weight of pooled spreads (0 = per-market only)
-    min_hist=30,        # below this, fall back to pooled spreads
-    decay=150,          # recency-decay tau (minutes) for empirical spreads
-    trend_mode="point",  # "point": x - p(t-look); "median": x - median(last look prices)
-    tail_mult=1.0,      # multiplier on the 5%/95% half-widths only (tail insurance)
-)
+INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
+TAUS = (0.05, 0.25, 0.5, 0.75, 0.95)
+Z = (-1.644854, -0.67449, 0.0, 0.67449, 1.644854)
+BASE_SIGMA = 0.0025
 
-def _quantile(sorted_vals, q):
-    """Linear-interpolation quantile of a sorted list."""
-    n = len(sorted_vals)
-    if n == 1:
-        return sorted_vals[0]
-    pos = q * (n - 1)
-    lo = int(math.floor(pos))
-    hi = min(lo + 1, n - 1)
-    frac = pos - lo
-    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
-
-
-_EXPW = {}  # decay tau -> precomputed exp(-age/tau) weights, age 0..65535
+# --- tunable parameters, calibrated on the six practice cases (see notes) ---
+# Calibration: coordinate descent on practice pinball loss, 2026-11-13.
+# Beats the house baseline (0.363589) on every practice case; overall 0.283.
+LEVEL_WINDOW = 90           # minutes averaged for the reversion level
+SHRINK = 0.6                # weight on the reversion adjustment
+RECENCY_TAU = 100.0         # minutes; exponential decay of window weights
+GRID = (1, 2, 3, 5, 8, 12, 18, 27, 40, 60, 90, 130, 180, 240)
+# Reversion strength by grid horizon, up-spikes and down-moves separately.
+# Up-spikes revert hard and increasingly with horizon; down-moves stick
+# fully (zero reversion won the calibration outright: a price that fell
+# stays fallen far more often than it bounces).
+BETA_UP = (0.1725, 0.2875, 0.345, 0.46, 0.552, 0.621, 0.69, 0.782,
+           0.8625, 0.92, 0.943, 0.9545, 0.966, 0.9775)
+BETA_DOWN = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+             0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+FLOOR_240 = 0.002           # minimum 90% half-width at h=240
+FLOOR_EXP = 0.37            # floor grows like h**FLOOR_EXP
+MIN_WINDOWS = 50            # windows needed to trust a market's own bands
+HISTORY_CAP = 1200          # only windows ending within the last N minutes
 
 
-def _exp_weights(tau, n):
-    w = _EXPW.get(tau)
-    if w is None or len(w) < n:
-        w = [math.exp(-a / tau) for a in range(max(n, 4321))]
-        _EXPW[tau] = w
-    return w
+def clamp6(x):
+    """x clamped to [0, 1] and rounded to 6 decimals (0, never -0)."""
+    return round(min(1.0, max(0.0, x)) * 1000000) / 1000000 + 0.0
+
+
+def _interp_log_h(grid, vals, h):
+    """Interpolate vals (given at grid horizons) at horizon h, in log-h."""
+    if h <= grid[0]:
+        return vals[0]
+    if h >= grid[-1]:
+        return vals[-1]
+    lh = math.log(h)
+    for i in range(len(grid) - 1):
+        if grid[i] <= h <= grid[i + 1]:
+            lo = math.log(grid[i])
+            hi = math.log(grid[i + 1])
+            f = (lh - lo) / (hi - lo) if hi > lo else 0.0
+            return vals[i] + (vals[i + 1] - vals[i]) * f
+    return vals[-1]
 
 
 def _weighted_quantiles(pairs, taus):
-    """All quantiles of values with weights in ONE sorted pass.
-
-    pairs: list of (value, weight). Returns [q for q in taus].
-    """
+    """Weighted quantiles of (value, weight) pairs, linearly interpolated."""
     pairs = sorted(pairs)
-    total = sum(w for _, w in pairs)
-    if total <= 0:
-        mid = pairs[len(pairs) // 2][0]
-        return [mid] * len(taus)
-    targets = [t * total for t in taus]
-    out = [None] * len(taus)
-    acc = 0.0
-    ti = 0
-    prev_v = pairs[0][0]
-    for v, w in pairs:
-        acc += w
-        while ti < len(taus) and acc >= targets[ti]:
-            overshoot = (acc - targets[ti]) / w if w > 0 else 0.0
-            out[ti] = v * (1 - overshoot) + prev_v * overshoot
-            ti += 1
-        prev_v = v
-    for j in range(len(taus)):
-        if out[j] is None:
-            out[j] = pairs[-1][0]
-    return out
-
-
-def _empirical_spreads(prices, window, h_grid, decay=0):
-    """Per-horizon empirical quantiles of h-minute changes, recentered.
-
-    decay: if > 0, recency-weight each change window by exp(-age/decay),
-    age in minutes from the most recent window. The window is truncated to
-    6*decay (weights beyond that are < 0.25% and cost compute).
-    Returns {h: [s05..s95]} with s_j = q_j - q_50.
-    """
-    if decay and decay > 0:
-        window = min(window, 6 * decay)
-    p = prices[-window:] if len(prices) > window else prices
-    n = len(p)
-    out = {}
-    for h in h_grid:
-        if n <= h:
-            continue
-        if decay and decay > 0:
-            w = _exp_weights(decay, n - h)
-            pairs = [(p[i + h] - p[i], w[(n - h - 1) - i]) for i in range(n - h)]
-            qs = _weighted_quantiles(pairs, TAUS)
+    cum = []
+    total = 0.0
+    for _, w in pairs:
+        total += w
+        cum.append(total)
+    out = []
+    for tau in taus:
+        target = tau * total
+        i = bisect.bisect_left(cum, target)
+        if i <= 0:
+            out.append(pairs[0][0])
+        elif i >= len(pairs):
+            out.append(pairs[-1][0])
         else:
-            ch = sorted(p[i + h] - p[i] for i in range(n - h))
-            qs = [_quantile(ch, t) for t in TAUS]
-        med = qs[2]
-        out[h] = [q - med for q in qs]
+            c0, c1 = cum[i - 1], cum[i]
+            v0, v1 = pairs[i - 1][0], pairs[i][0]
+            f = (target - c0) / (c1 - c0) if c1 > c0 else 0.0
+            out.append(v0 + (v1 - v0) * f)
     return out
 
 
-def _interp_spreads(spreads, h):
-    """Interpolate recentered spreads at horizon h (linear in log h)."""
-    hs = sorted(spreads)
-    if not hs:
-        return [0.0, 0.0, 0.0, 0.0, 0.0]
-    if h <= hs[0]:
-        return spreads[hs[0]]
-    if h >= hs[-1]:
-        return spreads[hs[-1]]
-    for i in range(len(hs) - 1):
-        if hs[i] <= h <= hs[i + 1]:
-            lo, hi = hs[i], hs[i + 1]
-            w = (math.log(h) - math.log(lo)) / (math.log(hi) - math.log(lo))
-            a, b = spreads[lo], spreads[hi]
-            return [a[j] * (1 - w) + b[j] * w for j in range(5)]
-    return spreads[hs[-1]]
-
-
-def _beta_up(h, P):
-    b = (P["beta_up_a"] + P["beta_up_b"] * math.log(max(h, 1))) * P["beta_up_shrink"]
-    return max(0.0, min(P["beta_up_max"], b))
-
-
-def _baseline_rows(x, horizon):
-    """House-baseline persistence forecast around x (fallback; never crashes)."""
-    z = [-1.644854, -0.67449, 0, 0.67449, 1.644854]
-    rows = []
-    for h in range(1, horizon + 1):
-        s = 0.0025 * math.sqrt(h)
-        q = [round(min(1.0, max(0.0, x + zi * s)), 6) + 0.0 for zi in z]
-        for j in range(1, 5):
-            q[j] = max(q[j], q[j - 1])
-        rows.append(q)
-    return rows
-
-
-def forecast_market(prices, horizon, P, pooled_spreads=None):
-    """Forecast rows for one market. prices: list of floats, last = checkpoint."""
-    if not prices:
-        return _baseline_rows(0.5, horizon)
-    x = prices[-1]
+def _median_path(prices, horizon):
+    """Reversion median for h = 1..horizon."""
     n = len(prices)
-    # --- median path: asymmetric reversion of the recent trend ---
-    look = P["trend_look"]
-    if P.get("trend_mode") == "median" and n > 1:
-        seg = sorted(prices[-look:] if n >= look else prices)
-        base = seg[len(seg) // 2]
-        trend = x - base
-    elif n > look:
-        trend = x - prices[-1 - look]
-    elif n > 1:
-        trend = x - prices[0]
-    else:
-        trend = 0.0
-    # --- spreads ---
-    if n >= P["min_hist"]:
-        spreads = _empirical_spreads(prices, P["window"], H_GRID, P.get("decay", 0))
-    else:
-        spreads = {}
-    use_pooled = pooled_spreads is not None and (not spreads or P["pool_blend"] > 0)
+    last = prices[-1]
+    w = min(LEVEL_WINDOW, n)
+    level = sum(prices[n - w:]) / w
+    dev = last - level
+    betas = BETA_UP if dev >= 0 else BETA_DOWN
+    path = []
+    for h in range(1, horizon + 1):
+        b = _interp_log_h(GRID, betas, h)
+        path.append(min(1.0, max(0.0, last - SHRINK * b * dev)))
+    return path
+
+
+def _one_min_sd(prices):
+    if len(prices) < 3:
+        return 0.0
+    diffs = [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
+    m = sum(diffs) / len(diffs)
+    var = sum((d - m) ** 2 for d in diffs) / len(diffs)
+    return math.sqrt(var)
+
+
+def _change_pairs(prices, g):
+    """Recency-weighted (change, weight) pairs for g-step moves."""
+    n = len(prices)
+    first = max(0, n - 1 - g - HISTORY_CAP)
+    pairs = []
+    for t in range(first, n - g):
+        age = (n - 1) - (t + g)
+        pairs.append((prices[t + g] - prices[t],
+                      math.exp(-age / RECENCY_TAU)))
+    return pairs
+
+
+def _build_pooled(all_prices):
+    """Pooled centred spreads per grid horizon + pooled 1-minute sd."""
+    pooled = {}
+    for g in GRID:
+        pairs = []
+        for prices in all_prices:
+            pairs.extend(_change_pairs(prices, g))
+        if len(pairs) >= MIN_WINDOWS:
+            qs = _weighted_quantiles(pairs, TAUS)
+            pooled[g] = [q - qs[2] for q in qs]
+        else:
+            pooled[g] = None
+    diffs = []
+    for prices in all_prices:
+        diffs.extend(prices[i + 1] - prices[i]
+                     for i in range(len(prices) - 1))
+    pooled_sd = None
+    if len(diffs) >= 2:
+        m = sum(diffs) / len(diffs)
+        pooled_sd = math.sqrt(sum((d - m) ** 2 for d in diffs) / len(diffs))
+    return pooled, pooled_sd
+
+
+def _vol_scale(prices, pooled_sd):
+    """Scale pooled bands to this market's own 1-minute volatility."""
+    if pooled_sd is None or pooled_sd <= 0:
+        return 1.0
+    own = _one_min_sd(prices)
+    if own <= 0:
+        return 0.25
+    return min(3.0, max(0.1, own / pooled_sd))
+
+
+def _market_spreads(prices, pooled, pooled_sd):
+    """Centred empirical spreads per grid horizon for one market."""
+    spreads = {}
+    for g in GRID:
+        pairs = _change_pairs(prices, g)
+        if len(pairs) >= MIN_WINDOWS:
+            qs = _weighted_quantiles(pairs, TAUS)
+            spreads[g] = [q - qs[2] for q in qs]
+        else:
+            spreads[g] = None
+    if any(v is None for v in spreads.values()) and pooled is not None:
+        scale = _vol_scale(prices, pooled_sd)
+        for g in GRID:
+            if spreads[g] is None and pooled[g] is not None:
+                spreads[g] = [s * scale for s in pooled[g]]
+    for g in GRID:
+        if spreads[g] is None:
+            s = BASE_SIGMA * math.sqrt(g)
+            spreads[g] = [z * s for z in Z]
+    return spreads
+
+
+def _floor(h):
+    return FLOOR_240 * (h / 240.0) ** FLOOR_EXP
+
+
+def _forecast_rows(prices, spreads, horizon):
+    med = _median_path(prices, horizon)
+    grid_spreads = [[spreads[g][j] for g in GRID] for j in range(5)]
     rows = []
     for h in range(1, horizon + 1):
-        if trend > 0:
-            med = x - _beta_up(h, P) * trend
-        else:
-            med = x - P["beta_dn"] * trend
-        med = min(1.0, max(0.0, med))
-        if spreads:
-            sp = _interp_spreads(spreads, h)
-            if use_pooled and P["pool_blend"] > 0:
-                pp = _interp_spreads(pooled_spreads, h)
-                w = P["pool_blend"]
-                sp = [sp[j] * (1 - w) + pp[j] * w for j in range(5)]
-        elif pooled_spreads:
-            sp = _interp_spreads(pooled_spreads, h)
-        else:
-            sp = [-0.0025 * 1.644854 * math.sqrt(h), -0.0025 * 0.67449 * math.sqrt(h),
-                  0.0, 0.0025 * 0.67449 * math.sqrt(h), 0.0025 * 1.644854 * math.sqrt(h)]
-        # floor: minimum half-width, growing with horizon
-        fl = P["floor_hw240"] * (h / 240.0) ** P["floor_exp"]
-        tm = P.get("tail_mult", 1.0)
-        lo_w = max(-sp[0], fl) * tm   # downside half-width at 5%
-        hi_w = max(sp[4], fl) * tm    # upside half-width at 95%
-        # scale the inner quantiles to at least the floor shape too
-        q = [med - lo_w,
-             med - max(-sp[1], fl * 0.41),
-             med,
-             med + max(sp[3], fl * 0.41),
-             med + hi_w]
-        # clamp, round, enforce non-decreasing
-        q = [min(1.0, max(0.0, v)) for v in q]
-        q = [round(v, 6) + 0.0 for v in q]
+        m = med[h - 1]
+        q = [m + _interp_log_h(GRID, grid_spreads[j], h) for j in range(5)]
+        hw = (q[4] - q[0]) / 2.0
+        fl = _floor(h)
+        if hw < fl:
+            if hw > 1e-12:
+                f = fl / hw
+                q = [m + (v - m) * f for v in q]
+            else:
+                q = [m + z * fl / 1.644854 for z in Z]
+        q = [clamp6(v) for v in q]
         for j in range(1, 5):
             if q[j] < q[j - 1]:
                 q[j] = q[j - 1]
@@ -235,56 +218,55 @@ def forecast_market(prices, horizon, P, pooled_spreads=None):
     return rows
 
 
-def pooled_spreads_all(markets, P):
-    """Pooled empirical spreads across markets (for thin-market fallback)."""
-    pooled = {}
-    for h in H_GRID:
-        ch = []
-        for m in markets:
-            p = m["prices"][-P["window"]:] if len(m["prices"]) > P["window"] else m["prices"]
-            if len(p) > h:
-                ch.extend(p[i + h] - p[i] for i in range(len(p) - h))
-        if not ch:
-            continue
-        ch.sort()
-        qs = [_quantile(ch, t) for t in TAUS]
-        med = qs[2]
-        pooled[h] = [q - med for q in qs]
-    return pooled
+def _baseline_rows(last, horizon):
+    """House persistence baseline: last price held flat, sqrt(h) bands."""
+    rows = []
+    for h in range(1, horizon + 1):
+        s = BASE_SIGMA * math.sqrt(h)
+        rows.append([clamp6(last + z * s) for z in Z])
+    return rows
 
 
-def forecast_case(case, P=None):
-    P = dict(DEFAULTS, **(P or {}))
+def _forecast_market(market, pooled, pooled_sd, horizon):
+    prices = market.get("prices") or []
+    if not prices:
+        return _baseline_rows(0.5, horizon)
+    spreads = _market_spreads(prices, pooled, pooled_sd)
+    return _forecast_rows(prices, spreads, horizon)
+
+
+def run_case(case):
     horizon = case["horizon_minutes"]
     markets = case["markets"]
-    pooled = pooled_spreads_all(markets, P) if any(len(m["prices"]) < P["min_hist"] for m in markets) or P["pool_blend"] > 0 else None
-    out = []
+    need_pooled = any(
+        len(m.get("prices") or []) < MIN_WINDOWS + GRID[-1] + 1
+        for m in markets)
+    pooled = pooled_sd = None
+    if need_pooled:
+        pooled, pooled_sd = _build_pooled(
+            [m.get("prices") or [] for m in markets])
+    forecasts = []
     for m in markets:
         try:
-            rows = forecast_market(m["prices"], horizon, P, pooled)
+            q = _forecast_market(m, pooled, pooled_sd, horizon)
         except Exception:
-            # One weird market must never kill the case: fall back to the
-            # house baseline for it (an invalid case scores as all-0.5).
-            x = m["prices"][-1] if m["prices"] else 0.5
-            rows = _baseline_rows(x, horizon)
-        out.append({"id": m["id"], "q": rows})
-    return {"forecasts": out}
+            prices = m.get("prices") or []
+            last = prices[-1] if prices else 0.5
+            q = _baseline_rows(last, horizon)
+        forecasts.append({"id": m["id"], "q": q})
+    return {"forecasts": forecasts}
 
 
 def main():
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(out_dir, exist_ok=True)
-    for f in sorted(os.listdir(in_dir)):
-        if not f.endswith(".in"):
-            continue
-        cid = f[:-3]
-        with open(os.path.join(in_dir, f)) as fh:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    files = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".in"))
+    for name in files:
+        with open(os.path.join(INPUT_DIR, name), "r", encoding="utf-8") as fh:
             case = json.load(fh)
-        fc = forecast_case(case)
-        with open(os.path.join(out_dir, cid + ".out"), "w") as fh:
-            json.dump(fc, fh)
-            fh.write("\n")
+        out = run_case(case)
+        with open(os.path.join(OUTPUT_DIR, name[:-3] + ".out"),
+                  "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(out) + "\n")
 
 
 if __name__ == "__main__":
